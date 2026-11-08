@@ -89,9 +89,11 @@ final class MotorVoz {
   private var relojSondeo: DispatchSourceTimer?
   private var relojResumen: DispatchSourceTimer?
 
-  // La captura que espera su envío. Como mucho 3 s: lo que llega tarde no es un dictado que se envía.
+  // La captura que espera su envío. Como mucho 9 s (hasta el 8-nov eran 3): con datos móviles el audio va por el relevo
+  // de Tailscale y cada envío tarda de 1 a 5 s; con 3 s se tiraba lo dicho mientras viajaba el envío anterior. Por debajo
+  // de los 10 s que acepta el PC por envío (MAX_CUERPO de movil.py).
   private var pendiente = Data()
-  private let maxPendiente = 16000 * 2 * 3
+  private let maxPendiente = 16000 * 2 * 9
   private var enviando = false
   private var cuenta = Cuenta()
   private var enviosDetallados = 0 // los primeros envíos tras cada arranque se anotan uno a uno
@@ -643,7 +645,7 @@ final class MotorVoz {
           self.avisar403()
           return
         }
-        // Lo no enviado vuelve delante, sin pasar de 3 s.
+        // Lo no enviado vuelve delante, sin pasar del tope.
         var junto = cuerpo
         junto.append(self.pendiente)
         if junto.count > self.maxPendiente {
