@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "AIOS voz",
+    "slug": "aios-voz",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "platforms": [
+      "ios"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.jonatanswdev.aiosvoz",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "La app manda lo que dices a tu AIOS, en tu PC, para que lo transcriba y te conteste.",
+        "UIBackgroundModes": [
+          "audio"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}

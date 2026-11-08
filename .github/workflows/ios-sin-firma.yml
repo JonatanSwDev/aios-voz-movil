@@ -1,0 +1,107 @@
+# Compila la app de iPhone SIN firmar en un runner de macOS y deja el .ipa como artefacto (README.md, «Compilar»).
+# No usa ningún secreto: ni firma, ni cuenta de Apple, ni la dirección del PC, ni la ficha.
+
+name: App de la voz · iOS sin firmar
+
+on:
+  push:
+    paths:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-sin-firma-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_DIR: .
+  ESQUEMA: AIOSvoz # el nombre que Expo saca de «AIOS voz» (el mismo que usó EAS el 8-nov)
+  IPA: AIOS-voz-sin-firmar.ipa
+
+jobs:
+  ipa:
+    # macos-26 (arm64): Xcode 26.6 por defecto en la imagen del 26-oct-2026; Expo SDK 58 pide Xcode 26.4 o más (según la
+    # doc de GitHub y de Expo leídas el 8-nov). Si un día no basta, el label xcode-27.
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reloj y versiones
+        run: |
+          echo "INICIO=$(date +%s)" >> "$GITHUB_ENV"
+          sw_vers
+          xcodebuild -version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+
+      - name: Dependencias
+        working-directory: ${{ env.APP_DIR }}
+        run: npm ci --no-audit --no-fund
+
+      - name: Prebuild de Expo (genera ios/ e instala los pods)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          echo "PREBUILD_INICIO=$(date +%s)" >> "$GITHUB_ENV"
+          npx expo prebuild -p ios --clean
+          # El módulo de audio tiene que estar enlazado: el 8-nov un verde de EAS salió sin él.
+          grep -q "AiosAudio" ios/Podfile.lock || { echo "::error::el pod AiosAudio no está en el Podfile.lock"; exit 1; }
+
+      - name: Info.plist (modo de fondo y micro)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          PLIST="ios/${ESQUEMA}/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST" | grep -q audio || { echo "::error::falta UIBackgroundModes audio"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$PLIST"
+
+      - name: Archivar sin firma
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -o pipefail
+          echo "ARCHIVO_INICIO=$(date +%s)" >> "$GITHUB_ENV"
+          xcodebuild \
+            -workspace "ios/${ESQUEMA}.xcworkspace" \
+            -scheme "$ESQUEMA" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/${ESQUEMA}.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive | tail -n 60
+
+      - name: El motor va dentro y el .ipa
+        run: |
+          APP="$RUNNER_TEMP/${ESQUEMA}.xcarchive/Products/Applications/${ESQUEMA}.app"
+          test -d "$APP" || { echo "::error::no hay .app en el archivo"; exit 1; }
+          # El módulo es un framework estático: su clase vive en el binario de la app.
+          strings "$APP/$ESQUEMA" | grep -q "AiosAudioModule" || { echo "::error::el binario no lleva AiosAudioModule"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry "$RUNNER_TEMP/$IPA" Payload)
+          ls -l "$RUNNER_TEMP/$IPA"
+
+      - name: Medida (tiempo y minutos de Mac)
+        if: always()
+        run: |
+          FIN=$(date +%s)
+          TOTAL=$(( FIN - INICIO ))
+          echo "## Compilación de iOS sin firmar" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Total del trabajo (desde el reloj): $(( TOTAL / 60 )) min $(( TOTAL % 60 )) s" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "${PREBUILD_INICIO:-}" ] && [ -n "${ARCHIVO_INICIO:-}" ] && echo "- Prebuild y pods: $(( ARCHIVO_INICIO - PREBUILD_INICIO )) s; archivado y .ipa: $(( FIN - ARCHIVO_INICIO )) s" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Minutos de Mac que factura GitHub: los del trabajo, redondeados por arriba (más el arranque antes del reloj); en un repositorio privado se multiplican (diario de la fase 3b)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Imagen: $(sw_vers -productVersion), $(xcodebuild -version | head -n 1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aios-voz-sin-firmar
+          path: ${{ runner.temp }}/${{ env.IPA }}
+          if-no-files-found: error
+          retention-days: 14
