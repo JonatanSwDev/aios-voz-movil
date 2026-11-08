@@ -8,6 +8,7 @@ export type AjustesVoz = {
   ficha: string
   ruta: Ruta
   ganancia: number
+  unidadDeVoz: boolean // la cancelación de eco de iOS
 }
 
 export type AiosAudioEvents = {

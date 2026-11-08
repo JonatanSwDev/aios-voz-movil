@@ -8,6 +8,7 @@ struct AjustesVoz: Record {
   @Field var ficha: String = ""
   @Field var ruta: String = "cascos" // «cascos» (manos libres) o «iphone» (el micro del aparato)
   @Field var ganancia: Double = 2.5
+  @Field var unidadDeVoz: Bool = true // la cancelación de eco de iOS; se puede apagar con los cascos (8-nov)
 }
 
 public class AiosAudioModule: Module {
@@ -38,7 +39,8 @@ public class AiosAudioModule: Module {
         base: base,
         ficha: ajustes.ficha,
         microDeLosCascos: ajustes.ruta != "iphone",
-        ganancia: ajustes.ganancia
+        ganancia: ajustes.ganancia,
+        unidadDeVoz: ajustes.unidadDeVoz
       )
       self.motor.empezar(a) { error in
         if let error = error {

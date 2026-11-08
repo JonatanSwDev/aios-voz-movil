@@ -13,12 +13,14 @@ import AiosAudio, { type Ruta } from './modules/aios-audio'
 const CLAVE_BASE = 'aios-voz-base'
 const CLAVE_FICHA = 'aios-voz-ficha'
 const CLAVE_RUTA = 'aios-voz-ruta'
+const CLAVE_ECO = 'aios-voz-eco'
 const GANANCIA = 2.5 // hasta que el PC diga la suya
 
 export default function App() {
   const [base, setBase] = useState('')
   const [ficha, setFicha] = useState('')
   const [ruta, setRuta] = useState<Ruta>('cascos')
+  const [eco, setEco] = useState(true) // la cancelación de eco de iOS (la unidad de voz)
   const [estado, setEstado] = useState(AiosAudio.estado())
   const [nivel, setNivel] = useState<number | null>(null)
   const [lineas, setLineas] = useState<string[]>(() => AiosAudio.registro().slice(-150))
@@ -31,6 +33,7 @@ export default function App() {
       setFicha((await SecureStore.getItemAsync(CLAVE_FICHA)) ?? '')
       const r = await SecureStore.getItemAsync(CLAVE_RUTA)
       if (r === 'iphone' || r === 'cascos') setRuta(r)
+      setEco((await SecureStore.getItemAsync(CLAVE_ECO)) !== 'no')
       cargado.current = true
     })()
     const subs = [
@@ -45,13 +48,14 @@ export default function App() {
     await SecureStore.setItemAsync(CLAVE_BASE, base.trim())
     await SecureStore.setItemAsync(CLAVE_FICHA, ficha.trim())
     await SecureStore.setItemAsync(CLAVE_RUTA, ruta)
+    await SecureStore.setItemAsync(CLAVE_ECO, eco ? 'si' : 'no')
   }
 
   const empezar = async () => {
     setAviso('')
     try {
       await guardar()
-      await AiosAudio.empezar({ base: base.trim(), ficha: ficha.trim(), ruta, ganancia: GANANCIA })
+      await AiosAudio.empezar({ base: base.trim(), ficha: ficha.trim(), ruta, ganancia: GANANCIA, unidadDeVoz: eco })
     } catch (e) {
       setAviso(e instanceof Error ? e.message : String(e))
     }
@@ -109,6 +113,16 @@ export default function App() {
           </Pressable>
         ))}
       </View>
+      <View style={estilos.fila}>
+        <Pressable
+          style={[estilos.opcion, eco ? estilos.opcionElegida : null]}
+          onPress={() => !enMarcha && setEco(!eco)}
+        >
+          <Text style={eco ? estilos.textoBoton : estilos.textoOpcion}>
+            {eco ? 'Cancelación de eco: SÍ' : 'Cancelación de eco: NO'}
+          </Text>
+        </Pressable>
+      </View>
 
       <View style={estilos.fila}>
         <Pressable style={[estilos.boton, estilos.empezar]} onPress={() => void empezar()} disabled={enMarcha}>
@@ -119,7 +133,11 @@ export default function App() {
         </Pressable>
         <Pressable
           style={[estilos.boton, estilos.copiar]}
-          onPress={() => void Clipboard.setStringAsync(lineas.join('\n')).then(() => setAviso('Registro copiado'))}
+          onPress={() => {
+            // El registro entero del motor (hasta 6.000 líneas), no solo lo que cabe en la pantalla.
+            const todo = AiosAudio.registro()
+            void Clipboard.setStringAsync(todo.join('\n')).then(() => setAviso(`Registro copiado: ${todo.length} líneas`))
+          }}
         >
           <Text style={estilos.textoBoton}>Copiar registro</Text>
         </Pressable>

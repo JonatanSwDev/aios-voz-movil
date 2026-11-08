@@ -1,8 +1,9 @@
 // El motor de audio de la app de la voz del AIOS (2026-11-08, plan brainstorms/2026-11-08-plan-app-iphone-brigada.md).
 //
-// Graba y reproduce a la vez en un solo AVAudioEngine con la unidad de voz de iOS (cancelación de eco, ruido y
-// ganancia, la de las llamadas), y habla con la escucha del PC en nativo, sin pasar por el JavaScript: con la pantalla
-// bloqueada iOS puede parar el JavaScript, pero no una app con audio en marcha y el modo de fondo «audio».
+// Graba y reproduce a la vez en un solo AVAudioEngine, con la unidad de voz de iOS (cancelación de eco, ruido y
+// ganancia, la de las llamadas) si está encendida en los ajustes, y habla con la escucha del PC en nativo, sin pasar por
+// el JavaScript: con la pantalla bloqueada iOS puede parar el JavaScript, pero no una app con audio en marcha y el modo de
+// fondo «audio».
 //
 // El protocolo es el de mods/aios-voz/escucha/movil.py, con la ficha en la cabecera X-Ficha:
 //   POST /audio?rate=16000   PCM int16 mono a 16 kHz, un envío cada 250 ms
@@ -13,6 +14,12 @@
 // Todo el estado vive en una cola serie (`cola`). El «tap» del micro corre en su propio hilo, con su conversor capturado,
 // y solo le pasa datos. El estado y el registro que lee el JavaScript van además en copias bajo un cerrojo, para que la
 // pantalla no espere a la cola. Auditado antes de compilar (centro-audit, 2026-11-08): lo corregido, en el diario.
+//
+// El registro (Jonatan, 8-nov: «logs a mansalva» para ver qué pasa al copiarlo): cada arranque y reanudación con la sesión
+// y el formato real del micro; los primeros envíos de cada arranque uno a uno, los que fallan o tardan siempre, y cada 5 s
+// un resumen de lo captado, enviado y tirado, con la latencia y el nivel; cada frase del PC (bajada, encolada, sonada);
+// los tonos, los cambios de estado con su motivo y los avisos de iOS con sus valores. Nunca la ficha; de la dirección,
+// solo su primera parte.
 
 import AVFoundation
 import Foundation
@@ -29,6 +36,24 @@ final class MotorVoz {
     let ficha: String
     let microDeLosCascos: Bool
     let ganancia: Double
+    let unidadDeVoz: Bool
+  }
+
+  /// Los contadores de un intervalo del resumen; se ponen a cero tras cada resumen.
+  private struct Cuenta {
+    var buffers = 0
+    var bytesCaptados = 0
+    var bytesTirados = 0
+    var dbSuma = 0.0
+    var dbMax = -200.0
+    var dbN = 0
+    var enviosOk = 0
+    var enviosMal = 0
+    var bytesEnviados = 0
+    var latSuma = 0
+    var latMax = 0
+    var sondeosOk = 0
+    var sondeosMal = 0
   }
 
   // Lo que el módulo de Expo le pasa al JavaScript.
@@ -38,9 +63,15 @@ final class MotorVoz {
 
   private var estadoActual = "parado"
   private var lineas: [String] = []
+  private let maxLineas = 6000
   private let cerrojo = NSLock()
   private var estadoCopia = "parado"
   private var lineasCopia: [String] = []
+  private let reloj: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss.SSS"
+    return f
+  }()
 
   private let cola = DispatchQueue(label: "aios.voz.motor")
   private var motor = AVAudioEngine()
@@ -56,11 +87,15 @@ final class MotorVoz {
   private var sesionRed: URLSession
   private var relojEnvio: DispatchSourceTimer?
   private var relojSondeo: DispatchSourceTimer?
+  private var relojResumen: DispatchSourceTimer?
 
   // La captura que espera su envío. Como mucho 3 s: lo que llega tarde no es un dictado que se envía.
   private var pendiente = Data()
   private let maxPendiente = 16000 * 2 * 3
   private var enviando = false
+  private var cuenta = Cuenta()
+  private var enviosDetallados = 0 // los primeros envíos tras cada arranque se anotan uno a uno
+  private var primerBuffer = true // el primer buffer del micro tras cada arranque se anota con su formato
 
   // Lo que dice el PC.
   private var sondeando = false
@@ -71,6 +106,7 @@ final class MotorVoz {
   private var ganancia = 2.5
   private var bajada: URLSessionDataTask?
   private var corte = 0 // sube en cada corte: lo que se estaba bajando antes no se toca
+  private var ultimoSondeoMal = Date.distantPast
 
   // El contacto con el PC, para el pitido de «sin PC» y el de vuelta. Un 403 cuenta como contacto: el PC está, lo que
   // falla es la ficha, y eso se dice con su estado, no con el pitido de «sin PC».
@@ -103,10 +139,22 @@ final class MotorVoz {
       [weak self] n in
       self?.interrupcion(n)
     })
+    observadores.append(centro.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) {
+      [weak self] n in
+      self?.cambioDeRuta(n)
+    })
+    observadores.append(centro.addObserver(forName: AVAudioSession.mediaServicesWereLostNotification, object: nil, queue: nil) {
+      [weak self] _ in
+      guard let self = self else { return }
+      self.cola.async { self.anotar("iOS: se perdieron los servicios de audio") }
+    })
     observadores.append(centro.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil) {
       [weak self] _ in
       guard let self = self else { return }
-      self.cola.async { self.rearrancar("los servicios de audio de iOS se reiniciaron") }
+      self.cola.async {
+        self.anotar("iOS: los servicios de audio se reiniciaron")
+        self.rearrancar("los servicios de audio de iOS se reiniciaron")
+      }
     })
     observadores.append(centro.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) {
       [weak self] n in
@@ -116,7 +164,7 @@ final class MotorVoz {
       // motor nuevo lo volvía a provocar, en bucle: se reanuda el MISMO motor, con el micro enganchado de nuevo.
       self.cola.async {
         guard let quien = n.object as? AVAudioEngine, quien === self.motor else { return }
-        self.anotar("aviso de cambio de configuración · \(self.estadoAudio())")
+        self.anotar("iOS: aviso de cambio de configuración del motor · \(self.estadoAudio())")
         self.programarReanudar("cambió la configuración del audio")
       }
     })
@@ -125,8 +173,14 @@ final class MotorVoz {
       [weak self] _ in
       guard let self = self else { return }
       self.cola.async {
+        self.anotar("iOS: la app pasa delante · \(self.estadoAudio())")
         if self.enMarcha && !self.motor.isRunning { self.programarReanudar("la app vuelve delante") }
       }
+    })
+    observadores.append(centro.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) {
+      [weak self] _ in
+      guard let self = self else { return }
+      self.cola.async { self.anotar("iOS: la app pasa a segundo plano · \(self.estadoAudio())") }
     })
   }
 
@@ -153,7 +207,7 @@ final class MotorVoz {
       return
     }
     guard permitido else {
-      fijarEstado("sin permiso de micro")
+      fijarEstado("sin permiso de micro", "iOS no da el micro")
       listo("sin permiso de micro: actívalo en Ajustes")
       return
     }
@@ -165,25 +219,26 @@ final class MotorVoz {
     primeraSalida = true
     colaFrases = []
     pendiente = Data()
+    cuenta = Cuenta()
     ultimoContacto = Date()
     ultimoTic = Date()
     sinPC = false
     reintentos = 0
     rearranques = []
+    anotar("empieza: \(a.microDeLosCascos ? "micro de los cascos" : "micro del iPhone"), unidad de voz \(a.unidadDeVoz ? "encendida" : "apagada"), PC \(hostVisible(a.base))")
     do {
       try configurarSesion(a)
       try montarMotor()
     } catch {
       desmontarMotor()
       anotar("no arranca el audio: \(error.localizedDescription)")
-      fijarEstado("error de audio")
+      fijarEstado("error de audio", "no arranca")
       listo("no arranca el audio: \(error.localizedDescription)")
       return
     }
     enMarcha = true
     arrancarRelojes()
-    anotar("empieza: \(a.microDeLosCascos ? "micro de los cascos" : "micro del iPhone"), \(a.base.host ?? "?")")
-    fijarEstado("conectando")
+    fijarEstado("conectando", "empieza")
     listo(nil)
   }
 
@@ -196,11 +251,14 @@ final class MotorVoz {
 
   private func pararDentro() {
     let estaba = enMarcha || montado
+    if estaba { resumir() }
     enMarcha = false
     relojEnvio?.cancel()
     relojSondeo?.cancel()
+    relojResumen?.cancel()
     relojEnvio = nil
     relojSondeo = nil
+    relojResumen = nil
     bajada?.cancel()
     bajada = nil
     desmontarMotor()
@@ -210,7 +268,7 @@ final class MotorVoz {
     guard estaba else { return }
     try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     anotar("para")
-    fijarEstado("parado")
+    fijarEstado("parado", "Parar")
   }
 
   /// Para la pantalla: copias bajo el cerrojo, sin esperar a la cola.
@@ -240,7 +298,7 @@ final class MotorVoz {
     }
     try s.setCategory(.playAndRecord, mode: .default, options: opciones)
     try s.setActive(true)
-    anotar("sesión: entrada \(s.currentRoute.inputs.first?.portName ?? "?"), salida \(s.currentRoute.outputs.first?.portName ?? "?")")
+    anotar("sesión activa · \(describirSesion())")
   }
 
   private func montarMotor() throws {
@@ -250,13 +308,17 @@ final class MotorVoz {
     montado = true
     let entrada = motor.inputNode
     // La unidad de voz de Apple: cancela el eco de lo que suena, quita ruido y ajusta la ganancia. Se enciende antes de
-    // leer el formato de la entrada y antes de arrancar.
-    try entrada.setVoiceProcessingEnabled(true)
-    if #available(iOS 17.0, *) {
-      entrada.voiceProcessingOtherAudioDuckingConfiguration =
-        AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+    // leer el formato de la entrada y antes de arrancar. Con los cascos se puede apagar (8-nov: con la unidad de voz
+    // encima del perfil de manos libres, buena parte de lo dicho llegaba al PC sin que Whisper sacara texto).
+    if ajustes?.unidadDeVoz ?? true {
+      try entrada.setVoiceProcessingEnabled(true)
+      if #available(iOS 17.0, *) {
+        entrada.voiceProcessingOtherAudioDuckingConfiguration =
+          AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+      }
     }
     let formatoEntrada = entrada.outputFormat(forBus: 0)
+    anotar("micro: unidad de voz \(entrada.isVoiceProcessingEnabled ? "encendida" : "apagada"), formato \(describirFormato(formatoEntrada))")
     guard formatoEntrada.sampleRate > 0, formatoEntrada.channelCount > 0 else {
       throw NSError(domain: "MotorVoz", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: "el micro no da formato (\(estadoAudio()))"])
@@ -276,7 +338,9 @@ final class MotorVoz {
     try motor.start()
     voz.play()
     pitidos.play()
-    anotar("motor en marcha: micro a \(Int(formatoEntrada.sampleRate)) Hz, \(formatoEntrada.channelCount) canal(es)")
+    enviosDetallados = 0
+    primerBuffer = true
+    anotar("motor en marcha: micro a \(Int(formatoEntrada.sampleRate)) Hz, \(formatoEntrada.channelCount) canal(es) · salida \(describirFormato(motor.outputNode.outputFormat(forBus: 0)))")
   }
 
   private func desmontarMotor() {
@@ -288,8 +352,8 @@ final class MotorVoz {
     motor.stop()
   }
 
-  /// Tras una interrupción o un cambio de ruta: el motor se monta de nuevo, sin perder la conexión con el PC. Si iOS no
-  /// le deja arrancar, lo reintenta cada 2 s hasta diez veces.
+  /// Tras perder los servicios de audio, o si reanudar no basta: el motor se monta de nuevo, sin perder la conexión con
+  /// el PC. Si iOS no le deja arrancar, lo reintenta cada 2 s hasta diez veces.
   private func rearrancar(_ motivo: String) {
     guard enMarcha, let a = ajustes else { return }
     let ahora = Date()
@@ -297,10 +361,10 @@ final class MotorVoz {
     if rearranques.count > 6 && motivo != "reintento" {
       desmontarMotor()
       anotar("demasiados rearranques en un minuto (\(motivo)): lo dejo parado; pulsa Parar y Empezar")
-      fijarEstado("error de audio")
+      fijarEstado("error de audio", "demasiados rearranques")
       return
     }
-    anotar("rearranco: \(motivo)")
+    anotar("rearranco (motor nuevo): \(motivo)")
     bajada?.cancel()
     bajada = nil
     desmontarMotor()
@@ -310,12 +374,12 @@ final class MotorVoz {
       try configurarSesion(a)
       try montarMotor()
       reintentos = 0
-      fijarEstado(sinPC ? "sin PC" : "conectado")
+      fijarEstado(sinPC ? "sin PC" : "conectado", "motor nuevo")
     } catch {
       desmontarMotor()
       reintentos += 1
       anotar("no rearranca (\(reintentos)): \(error.localizedDescription)")
-      fijarEstado("error de audio")
+      fijarEstado("error de audio", "no rearranca")
       if reintentos <= 10 {
         cola.asyncAfter(deadline: .now() + 2) { [weak self] in self?.rearrancar("reintento") }
       }
@@ -342,14 +406,17 @@ final class MotorVoz {
       rearrancar(motivo)
       return
     }
-    if motor.isRunning { return }
+    if motor.isRunning {
+      anotar("no hace falta reanudar (\(motivo)): el motor ya corre")
+      return
+    }
     if motivo != "reintento" {
       let ahora = Date()
       rearranques = rearranques.filter { ahora.timeIntervalSince($0) < 60 } + [ahora]
       if rearranques.count > 8 {
         desmontarMotor()
         anotar("demasiadas reanudaciones en un minuto (\(motivo)): lo dejo parado; pulsa Parar y Empezar")
-        fijarEstado("error de audio")
+        fijarEstado("error de audio", "demasiadas reanudaciones")
         return
       }
     }
@@ -360,7 +427,7 @@ final class MotorVoz {
     guard formato.sampleRate > 0, formato.channelCount > 0,
           let conv = AVAudioConverter(from: formato, to: formatoEnvio) else {
       reintentos += 1
-      anotar("el micro aún no da formato (\(reintentos)): reintento en 1 s")
+      anotar("el micro aún no da formato (\(reintentos)): \(describirFormato(formato)); reintento en 1 s")
       if reintentos <= 10 {
         cola.asyncAfter(deadline: .now() + 1) { [weak self] in self?.reanudarMotor("reintento") }
       } else {
@@ -377,12 +444,14 @@ final class MotorVoz {
       voz.play()
       pitidos.play()
       reintentos = 0
-      anotar("motor reanudado: micro a \(Int(formato.sampleRate)) Hz, \(formato.channelCount) canal(es)")
-      fijarEstado(sinPC ? "sin PC" : "conectando")
+      enviosDetallados = 0
+      primerBuffer = true
+      anotar("motor reanudado: micro \(describirFormato(formato)), unidad de voz \(entrada.isVoiceProcessingEnabled ? "encendida" : "apagada") · \(describirSesion())")
+      fijarEstado(sinPC ? "sin PC" : "conectando", "motor reanudado")
     } catch {
       reintentos += 1
       anotar("no reanuda (\(reintentos)): \(error.localizedDescription)")
-      fijarEstado("error de audio")
+      fijarEstado("error de audio", "no reanuda")
       if reintentos <= 10 {
         cola.asyncAfter(deadline: .now() + 2) { [weak self] in self?.reanudarMotor("reintento") }
       } else {
@@ -391,32 +460,47 @@ final class MotorVoz {
     }
   }
 
-  /// Para el registro: la frecuencia de la sesión, el micro de la ruta y su formato, y si el motor corre.
-  private func estadoAudio() -> String {
-    let s = AVAudioSession.sharedInstance()
-    var micro = "-"
-    if montado {
-      let f = motor.inputNode.outputFormat(forBus: 0)
-      micro = "\(Int(f.sampleRate)) Hz \(f.channelCount) c"
-    }
-    let entrada = s.currentRoute.inputs.first?.portType.rawValue ?? "?"
-    return "sesión \(Int(s.sampleRate)) Hz, entrada \(entrada), micro \(micro), motor \(motor.isRunning ? "en marcha" : "parado")"
-  }
+  // MARK: - Lo que dice iOS
 
   private func interrupcion(_ n: Notification) {
     guard let valor = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
           let tipo = AVAudioSession.InterruptionType(rawValue: valor) else { return }
+    let opciones = n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
     cola.async {
       switch tipo {
       case .began:
-        self.anotar("interrupción: empieza")
-        self.fijarEstado("interrumpido")
+        self.anotar("iOS: interrupción, empieza · \(self.estadoAudio())")
+        self.fijarEstado("interrumpido", "interrupción de iOS")
       case .ended:
-        self.anotar("interrupción: acaba")
+        let reanudar = AVAudioSession.InterruptionOptions(rawValue: opciones).contains(.shouldResume)
+        self.anotar("iOS: interrupción, acaba (iOS \(reanudar ? "pide" : "no pide") reanudar) · \(self.estadoAudio())")
         self.programarReanudar("fin de la interrupción")
       @unknown default:
-        break
+        self.anotar("iOS: interrupción de tipo desconocido (\(valor))")
       }
+    }
+  }
+
+  private func cambioDeRuta(_ n: Notification) {
+    let valor = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+    let anterior = n.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
+    let antes = anterior.map { describirRuta($0) } ?? "?"
+    cola.async {
+      self.anotar("iOS: cambio de ruta (\(self.nombreMotivoRuta(valor))) · antes \(antes) · ahora \(self.describirRuta(AVAudioSession.sharedInstance().currentRoute)) · motor \(self.motor.isRunning ? "en marcha" : "parado")")
+    }
+  }
+
+  private func nombreMotivoRuta(_ v: UInt) -> String {
+    guard let motivo = AVAudioSession.RouteChangeReason(rawValue: v) else { return "desconocido \(v)" }
+    switch motivo {
+    case .newDeviceAvailable: return "aparato nuevo"
+    case .oldDeviceUnavailable: return "se fue un aparato"
+    case .categoryChange: return "cambio de categoría"
+    case .override: return "anulación"
+    case .wakeFromSleep: return "vuelta del reposo"
+    case .noSuitableRouteForCategory: return "sin ruta para la categoría"
+    case .routeConfigurationChange: return "cambio de configuración de la ruta"
+    default: return "desconocido \(v)"
     }
   }
 
@@ -425,6 +509,8 @@ final class MotorVoz {
   /// En el hilo del micro: convierte a 16 kHz int16 mono y se lo pasa a la cola.
   private func capturado(_ buffer: AVAudioPCMBuffer, _ conv: AVAudioConverter) {
     guard buffer.frameLength > 0 else { return }
+    let formato = buffer.format
+    let tramasEntrada = Int(buffer.frameLength)
     let capacidad = AVAudioFrameCount(Double(buffer.frameLength) * formatoEnvio.sampleRate / buffer.format.sampleRate) + 64
     guard let salida = AVAudioPCMBuffer(pcmFormat: formatoEnvio, frameCapacity: capacidad) else { return }
     let entregado = Bandera()
@@ -438,7 +524,11 @@ final class MotorVoz {
       estadoEntrada.pointee = .haveData
       return buffer
     }
-    guard estado != .error, error == nil, salida.frameLength > 0, let canal = salida.int16ChannelData else { return }
+    guard estado != .error, error == nil, salida.frameLength > 0, let canal = salida.int16ChannelData else {
+      let motivo = error?.localizedDescription ?? "estado \(estado.rawValue), \(salida.frameLength) tramas"
+      cola.async { self.anotar("el conversor del micro falla: \(motivo)") }
+      return
+    }
     let n = Int(salida.frameLength)
     let datos = Data(bytes: canal[0], count: n * 2)
     var suma = 0.0
@@ -449,9 +539,20 @@ final class MotorVoz {
     let db = 20 * log10(max(sqrt(suma / Double(n)), 0.000_01))
     cola.async {
       guard self.enMarcha else { return }
+      if self.primerBuffer {
+        self.primerBuffer = false
+        self.anotar("primer buffer del micro: \(tramasEntrada) tramas en \(self.describirFormato(formato)) → \(n) tramas a 16 kHz int16, \(Int(db)) dB")
+      }
+      self.cuenta.buffers += 1
+      self.cuenta.bytesCaptados += datos.count
+      self.cuenta.dbSuma += db
+      self.cuenta.dbN += 1
+      self.cuenta.dbMax = max(self.cuenta.dbMax, db)
       self.pendiente.append(datos)
       if self.pendiente.count > self.maxPendiente {
-        self.pendiente.removeFirst(self.pendiente.count - self.maxPendiente)
+        let sobra = self.pendiente.count - self.maxPendiente
+        self.pendiente.removeFirst(sobra)
+        self.cuenta.bytesTirados += sobra
       }
       let ahora = Date()
       if ahora.timeIntervalSince(self.ultimoNivel) >= 0.5 {
@@ -477,6 +578,20 @@ final class MotorVoz {
     }
     sondeo.resume()
     relojSondeo = sondeo
+    let resumen = DispatchSource.makeTimerSource(queue: cola)
+    resumen.schedule(deadline: .now() + 5, repeating: 5)
+    resumen.setEventHandler { [weak self] in self?.resumir() }
+    resumen.resume()
+    relojResumen = resumen
+  }
+
+  /// Cada 5 s: lo captado, lo enviado y lo tirado, la latencia, el nivel y el motor.
+  private func resumir() {
+    let c = cuenta
+    cuenta = Cuenta()
+    let nivel = c.dbN > 0 ? "\(Int(c.dbSuma / Double(c.dbN))) dB medio, \(Int(c.dbMax)) dB máximo" : "sin audio del micro"
+    let latencia = c.enviosOk > 0 ? "\(c.latSuma / c.enviosOk) ms medio, \(c.latMax) ms máximo" : "-"
+    anotar("resumen 5 s · micro: \(c.buffers) buffers, \(c.bytesCaptados) B, \(nivel) · envíos: \(c.enviosOk) bien, \(c.enviosMal) mal, \(c.bytesEnviados) B, latencia \(latencia) · tirado \(c.bytesTirados) B, pendiente \(pendiente.count) B · sondeos: \(c.sondeosOk) bien, \(c.sondeosMal) mal · motor \(motor.isRunning ? "en marcha" : "parado"), estado \(estadoActual)")
   }
 
   private func peticion(_ ruta: String, _ consulta: [URLQueryItem] = []) -> URLRequest? {
@@ -499,13 +614,28 @@ final class MotorVoz {
     enviando = true
     r.httpMethod = "POST"
     r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+    let inicio = Date()
     sesionRed.uploadTask(with: r, from: cuerpo) { [weak self] _, respuesta, error in
       guard let self = self else { return }
       self.cola.async {
         self.enviando = false
-        guard self.enMarcha else { return }
+        let ms = Int(Date().timeIntervalSince(inicio) * 1000)
         let codigo = (respuesta as? HTTPURLResponse)?.statusCode ?? 0
-        if error == nil && codigo == 204 {
+        let bien = error == nil && codigo == 204
+        if bien {
+          self.cuenta.enviosOk += 1
+          self.cuenta.bytesEnviados += cuerpo.count
+          self.cuenta.latSuma += ms
+          self.cuenta.latMax = max(self.cuenta.latMax, ms)
+        } else {
+          self.cuenta.enviosMal += 1
+        }
+        if self.enviosDetallados < 12 || !bien || ms > 800 {
+          self.enviosDetallados += 1
+          self.anotar("→ audio \(cuerpo.count) B a 16000 Hz: \(codigo == 0 ? "sin respuesta" : String(codigo)) en \(ms) ms\(error.map { " · \($0.localizedDescription)" } ?? "")")
+        }
+        guard self.enMarcha else { return }
+        if bien {
           self.contacto()
           return
         }
@@ -516,7 +646,11 @@ final class MotorVoz {
         // Lo no enviado vuelve delante, sin pasar de 3 s.
         var junto = cuerpo
         junto.append(self.pendiente)
-        if junto.count > self.maxPendiente { junto.removeFirst(junto.count - self.maxPendiente) }
+        if junto.count > self.maxPendiente {
+          let sobra = junto.count - self.maxPendiente
+          junto.removeFirst(sobra)
+          self.cuenta.bytesTirados += sobra
+        }
         self.pendiente = junto
       }
     }.resume()
@@ -544,11 +678,21 @@ final class MotorVoz {
         guard self.enMarcha else { return }
         let codigo = (respuesta as? HTTPURLResponse)?.statusCode ?? 0
         if codigo == 403 {
+          self.cuenta.sondeosMal += 1
           self.avisar403()
           return
         }
         guard error == nil, codigo == 200, let datos = datos,
-              let s = try? JSONDecoder().decode(Salida.self, from: datos) else { return }
+              let s = try? JSONDecoder().decode(Salida.self, from: datos) else {
+          self.cuenta.sondeosMal += 1
+          let ahora = Date()
+          if ahora.timeIntervalSince(self.ultimoSondeoMal) > 10 {
+            self.ultimoSondeoMal = ahora
+            self.anotar("← salida: \(codigo == 0 ? "sin respuesta" : String(codigo))\(error.map { " · \($0.localizedDescription)" } ?? "")")
+          }
+          return
+        }
+        self.cuenta.sondeosOk += 1
         self.contacto()
         self.recibir(s)
       }
@@ -562,10 +706,11 @@ final class MotorVoz {
       primeraSalida = false
       gen = s.gen
       ultimaN = s.frases.map { $0.n }.max() ?? 0
+      anotar("← salida inicial: generación \(s.gen), \(s.frases.count) frase(s) que no se dicen, ganancia \(ganancia)")
       return
     }
     if s.gen != gen {
-      anotar("corte (generación \(s.gen))")
+      anotar("← corte (generación \(gen) → \(s.gen)): se calla lo que suena y se tira la cola (\(colaFrases.count) pendiente(s))")
       cortar()
       gen = s.gen
       // Al cambiar de generación lo que haya en la salida es nuevo: se empieza por la primera.
@@ -574,6 +719,7 @@ final class MotorVoz {
     let nuevas = s.frases.filter { $0.gen == s.gen && $0.n > ultimaN }.sorted { $0.n < $1.n }
     guard let ultima = nuevas.last else { return }
     ultimaN = ultima.n
+    anotar("← \(nuevas.count) frase(s) nueva(s): \(nuevas.map { $0.wav }.joined(separator: " "))")
     colaFrases.append(contentsOf: nuevas.map { $0.wav })
     bajarSiguiente()
   }
@@ -594,6 +740,7 @@ final class MotorVoz {
     let nombre = colaFrases.removeFirst()
     guard let r = peticion("/wav/\(nombre)", [URLQueryItem(name: "g", value: String(format: "%.2f", ganancia))]) else { return }
     let deEsteCorte = corte
+    let inicio = Date()
     let tarea = sesionRed.dataTask(with: r) { [weak self] datos, respuesta, error in
       guard let self = self else { return }
       self.cola.async {
@@ -601,10 +748,12 @@ final class MotorVoz {
         self.bajada = nil
         defer { self.bajarSiguiente() }
         let codigo = (respuesta as? HTTPURLResponse)?.statusCode ?? 0
+        let ms = Int(Date().timeIntervalSince(inicio) * 1000)
         guard error == nil, codigo == 200, let datos = datos else {
-          self.anotar("no pude bajar \(nombre): \(codigo) \(error?.localizedDescription ?? "")")
+          self.anotar("↓ no pude bajar \(nombre): \(codigo) en \(ms) ms \(error?.localizedDescription ?? "")")
           return
         }
+        self.anotar("↓ \(nombre): \(datos.count) B en \(ms) ms")
         self.contacto()
         self.sonar(datos, nombre)
       }
@@ -622,14 +771,25 @@ final class MotorVoz {
       guard let leido = AVAudioPCMBuffer(pcmFormat: f.processingFormat, frameCapacity: AVAudioFrameCount(f.length)) else { return }
       try f.read(into: leido)
       guard let buffer = aFormatoVoz(leido) else {
-        anotar("no pude convertir \(nombre) (\(Int(f.processingFormat.sampleRate)) Hz)")
+        anotar("♪ no pude convertir \(nombre) (\(describirFormato(f.processingFormat)))")
         return
       }
-      guard motor.isRunning else { return }
-      voz.scheduleBuffer(buffer, completionHandler: nil)
+      guard motor.isRunning else {
+        anotar("♪ \(nombre) no suena: el motor está parado")
+        return
+      }
+      let segundos = Double(buffer.frameLength) / formatoVoz.sampleRate
+      let deEsteCorte = corte
+      voz.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+        guard let self = self else { return }
+        self.cola.async {
+          if self.corte == deEsteCorte { self.anotar("♪ sonó \(nombre)") }
+        }
+      }
       if !voz.isPlaying { voz.play() }
+      anotar("♪ encolada \(nombre): \(String(format: "%.1f", segundos)) s, reproductor \(voz.isPlaying ? "sonando" : "parado")")
     } catch {
-      anotar("no pude leer \(nombre): \(error.localizedDescription)")
+      anotar("♪ no pude leer \(nombre): \(error.localizedDescription)")
     }
   }
 
@@ -660,15 +820,15 @@ final class MotorVoz {
     if sinPC {
       sinPC = false
       anotar("el PC vuelve")
-      pitar([880, 1320])
+      pitar([880, 1320], "el PC vuelve")
     }
-    if ["conectando", "sin PC", "ficha mala"].contains(estadoActual) { fijarEstado("conectado") }
+    if ["conectando", "sin PC", "ficha mala"].contains(estadoActual) { fijarEstado("conectado", "el PC contesta") }
   }
 
   private func avisar403() {
     ultimoContacto = Date() // el PC contesta: no es «sin PC»
     sinPC = false
-    if estadoActual != "ficha mala" { fijarEstado("ficha mala") }
+    if estadoActual != "ficha mala" { fijarEstado("ficha mala", "el PC contesta 403") }
     let ahora = Date()
     guard ahora.timeIntervalSince(ultimo403) > 30 else { return }
     ultimo403 = ahora
@@ -685,13 +845,16 @@ final class MotorVoz {
     guard enMarcha, !sinPC, ahora.timeIntervalSince(ultimoContacto) > plazoSinPC else { return }
     sinPC = true
     anotar("sin PC desde hace \(Int(plazoSinPC)) s")
-    fijarEstado("sin PC")
-    pitar([660, 440])
+    fijarEstado("sin PC", "más de \(Int(plazoSinPC)) s sin respuesta")
+    pitar([660, 440], "sin PC")
   }
 
   /// Dos tonos cortos: subiendo, el PC vuelve; bajando, el PC no contesta.
-  private func pitar(_ frecuencias: [Double]) {
-    guard motor.isRunning else { return }
+  private func pitar(_ frecuencias: [Double], _ motivo: String) {
+    guard motor.isRunning else {
+      anotar("tono «\(motivo)» sin sonar: el motor está parado")
+      return
+    }
     let tasa = formatoVoz.sampleRate
     let tono = Int(tasa * 0.12)
     let hueco = Int(tasa * 0.06)
@@ -713,11 +876,55 @@ final class MotorVoz {
     }
     pitidos.scheduleBuffer(b, completionHandler: nil)
     if !pitidos.isPlaying { pitidos.play() }
+    anotar("tono: \(frecuencias.map { String(Int($0)) }.joined(separator: " → ")) Hz (\(motivo))")
+  }
+
+  // MARK: - Descripciones para el registro
+
+  /// La frecuencia de la sesión, el micro de la ruta y su formato, y si el motor corre.
+  private func estadoAudio() -> String {
+    let s = AVAudioSession.sharedInstance()
+    var micro = "-"
+    if montado {
+      micro = describirFormato(motor.inputNode.outputFormat(forBus: 0))
+    }
+    let entrada = s.currentRoute.inputs.first?.portType.rawValue ?? "?"
+    return "sesión \(Int(s.sampleRate)) Hz, entrada \(entrada), micro \(micro), motor \(motor.isRunning ? "en marcha" : "parado")"
+  }
+
+  private func describirSesion() -> String {
+    let s = AVAudioSession.sharedInstance()
+    return "\(Int(s.sampleRate)) Hz, búfer \(Int(s.ioBufferDuration * 1000)) ms, latencia entrada \(Int(s.inputLatency * 1000)) ms y salida \(Int(s.outputLatency * 1000)) ms, categoría \(s.category.rawValue), modo \(s.mode.rawValue), opciones \(s.categoryOptions.rawValue), canales entrada \(s.inputNumberOfChannels), ruta \(describirRuta(s.currentRoute))"
+  }
+
+  private func describirRuta(_ r: AVAudioSessionRouteDescription) -> String {
+    let ent = r.inputs.map { "\($0.portType.rawValue) «\($0.portName)»" }.joined(separator: " + ")
+    let sal = r.outputs.map { "\($0.portType.rawValue) «\($0.portName)»" }.joined(separator: " + ")
+    return "entrada \(ent.isEmpty ? "-" : ent), salida \(sal.isEmpty ? "-" : sal)"
+  }
+
+  private func describirFormato(_ f: AVAudioFormat) -> String {
+    let muestra: String
+    switch f.commonFormat {
+    case .pcmFormatFloat32: muestra = "float32"
+    case .pcmFormatFloat64: muestra = "float64"
+    case .pcmFormatInt16: muestra = "int16"
+    case .pcmFormatInt32: muestra = "int32"
+    default: muestra = "otro"
+    }
+    return "\(Int(f.sampleRate)) Hz, \(f.channelCount) c, \(muestra), \(f.isInterleaved ? "entrelazado" : "planar")"
+  }
+
+  /// De la dirección del PC, solo la primera parte del nombre: el registro se copia y se pega.
+  private func hostVisible(_ u: URL) -> String {
+    guard let h = u.host, let primera = h.split(separator: ".").first else { return "?" }
+    return "\(u.scheme ?? "?")://\(primera).…"
   }
 
   // MARK: - El estado y el registro
 
-  private func fijarEstado(_ e: String) {
+  private func fijarEstado(_ e: String, _ motivo: String = "") {
+    if e != estadoActual { anotar("estado: \(estadoActual) → \(e)\(motivo.isEmpty ? "" : " (\(motivo))")") }
     estadoActual = e
     cerrojo.lock()
     estadoCopia = e
@@ -726,11 +933,9 @@ final class MotorVoz {
   }
 
   private func anotar(_ l: String) {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss"
-    let linea = "\(f.string(from: Date()))  \(l)"
+    let linea = "\(reloj.string(from: Date()))  \(l)"
     lineas.append(linea)
-    if lineas.count > 300 { lineas.removeFirst(lineas.count - 300) }
+    if lineas.count > maxLineas { lineas.removeFirst(lineas.count - maxLineas) }
     cerrojo.lock()
     lineasCopia = lineas
     cerrojo.unlock()
