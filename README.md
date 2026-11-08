@@ -33,4 +33,9 @@ una cuenta de desarrollador.
 
 ## Estado
 
-MVP sin probar todavía en un iPhone. Sin licencia por ahora: todos los derechos reservados.
+MVP sin probar todavía en un iPhone. Este repositorio público es temporal: se retirará cuando la app se compile con una
+cuenta de desarrollador de pago.
+
+## Licencia
+
+MIT, en `LICENSE`.
