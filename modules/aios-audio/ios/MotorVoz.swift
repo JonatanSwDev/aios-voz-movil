@@ -85,6 +85,12 @@ final class MotorVoz {
   private var enMarcha = false
   private var sesion = 0 // sube al empezar y al parar: un permiso que llega tarde no arranca nada
   private var sesionRed: URLSession
+  // Las frases se bajan con más margen (30 s) que los envíos (10 s): por el relevo de Tailscale, en datos, una frase larga
+  // no acababa de bajar en 10 s con el PC contestando (8-nov, «200 en 10020 ms»).
+  private var sesionBajadas: URLSession
+  // Si la salida pasa al altavoz del iPhone (los cascos se van), la voz se calla: en el gimnasio hablaría en voz alta
+  // desde el bolsillo (8-nov). Suena un tono, y vuelve a sonar cuando vuelven los cascos.
+  private var porAltavoz = false
   private var relojEnvio: DispatchSourceTimer?
   private var relojSondeo: DispatchSourceTimer?
   private var relojResumen: DispatchSourceTimer?
@@ -136,6 +142,12 @@ final class MotorVoz {
     c.requestCachePolicy = .reloadIgnoringLocalCacheData
     c.httpMaximumConnectionsPerHost = 4
     sesionRed = URLSession(configuration: c)
+    let cb = URLSessionConfiguration.default
+    cb.timeoutIntervalForRequest = 30
+    cb.timeoutIntervalForResource = 30
+    cb.waitsForConnectivity = false
+    cb.requestCachePolicy = .reloadIgnoringLocalCacheData
+    sesionBajadas = URLSession(configuration: cb)
     let centro = NotificationCenter.default
     observadores.append(centro.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) {
       [weak self] n in
@@ -214,6 +226,7 @@ final class MotorVoz {
       return
     }
     if enMarcha { pararDentro() }
+    porAltavoz = false
     ajustes = a
     ganancia = a.ganancia // hasta que la salida del PC diga la suya
     gen = -1
@@ -241,6 +254,7 @@ final class MotorVoz {
     enMarcha = true
     arrancarRelojes()
     fijarEstado("conectando", "empieza")
+    mirarAltavoz()
     listo(nil)
   }
 
@@ -336,6 +350,7 @@ final class MotorVoz {
     motor.attach(pitidos)
     motor.connect(voz, to: motor.mainMixerNode, format: formatoVoz)
     motor.connect(pitidos, to: motor.mainMixerNode, format: formatoVoz)
+    voz.volume = porAltavoz ? 0 : 1 // un motor nuevo sin cascos sigue callado
     motor.prepare()
     try motor.start()
     voz.play()
@@ -489,6 +504,31 @@ final class MotorVoz {
     let antes = anterior.map { describirRuta($0) } ?? "?"
     cola.async {
       self.anotar("iOS: cambio de ruta (\(self.nombreMotivoRuta(valor))) · antes \(antes) · ahora \(self.describirRuta(AVAudioSession.sharedInstance().currentRoute)) · motor \(self.motor.isRunning ? "en marcha" : "parado")")
+      self.mirarAltavoz()
+    }
+  }
+
+  /// La salida va por el altavoz o el auricular del propio iPhone (no por unos cascos).
+  private func saleSinCascos() -> Bool {
+    let salidas = AVAudioSession.sharedInstance().currentRoute.outputs
+    return salidas.contains { $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver }
+  }
+
+  /// Sin cascos, la voz se calla (y lo que quede en la cola se tira) con un tono; con cascos otra vez, vuelve a sonar.
+  private func mirarAltavoz() {
+    guard enMarcha else { return }
+    let ahora = saleSinCascos()
+    if ahora == porAltavoz { return }
+    porAltavoz = ahora
+    if ahora {
+      anotar("sin cascos: la salida va por el iPhone; la voz se calla hasta que vuelvan los cascos")
+      cortar()
+      voz.volume = 0
+      pitar([440], "sin cascos", volumen: 0.1)
+    } else {
+      voz.volume = 1
+      anotar("vuelven los cascos: la voz vuelve a sonar")
+      pitar([660, 880], "vuelven los cascos")
     }
   }
 
@@ -743,7 +783,7 @@ final class MotorVoz {
     guard let r = peticion("/wav/\(nombre)", [URLQueryItem(name: "g", value: String(format: "%.2f", ganancia))]) else { return }
     let deEsteCorte = corte
     let inicio = Date()
-    let tarea = sesionRed.dataTask(with: r) { [weak self] datos, respuesta, error in
+    let tarea = sesionBajadas.dataTask(with: r) { [weak self] datos, respuesta, error in
       guard let self = self else { return }
       self.cola.async {
         guard self.corte == deEsteCorte else { return } // cancelada o llegó tras un «calla»: no suena
@@ -778,6 +818,10 @@ final class MotorVoz {
       }
       guard motor.isRunning else {
         anotar("♪ \(nombre) no suena: el motor está parado")
+        return
+      }
+      guard !porAltavoz else {
+        anotar("♪ \(nombre) no suena: sin cascos, la salida va por el iPhone")
         return
       }
       let segundos = Double(buffer.frameLength) / formatoVoz.sampleRate
@@ -852,7 +896,7 @@ final class MotorVoz {
   }
 
   /// Dos tonos cortos: subiendo, el PC vuelve; bajando, el PC no contesta.
-  private func pitar(_ frecuencias: [Double], _ motivo: String) {
+  private func pitar(_ frecuencias: [Double], _ motivo: String, volumen: Double = 0.3) {
     guard motor.isRunning else {
       anotar("tono «\(motivo)» sin sonar: el motor está parado")
       return
@@ -868,7 +912,7 @@ final class MotorVoz {
     for f in frecuencias {
       for k in 0..<tono {
         let rampa = min(1.0, Double(min(k, tono - k)) / (tasa * 0.01))
-        canal[0][i] = Float(0.3 * rampa * sin(2 * Double.pi * f * Double(k) / tasa))
+        canal[0][i] = Float(volumen * rampa * sin(2 * Double.pi * f * Double(k) / tasa))
         i += 1
       }
       for _ in 0..<hueco {
