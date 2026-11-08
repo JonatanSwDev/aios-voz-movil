@@ -91,6 +91,8 @@ final class MotorVoz {
   // Si la salida pasa al altavoz del iPhone (los cascos se van), la voz se calla: en el gimnasio hablaría en voz alta
   // desde el bolsillo (8-nov). Suena un tono, y vuelve a sonar cuando vuelven los cascos.
   private var porAltavoz = false
+  // Cuándo debería acabar de sonar lo encolado: cada frase suena tras las anteriores (para la red de seguridad).
+  private var finPrevisto = Date.distantPast
   private var relojEnvio: DispatchSourceTimer?
   private var relojSondeo: DispatchSourceTimer?
   private var relojResumen: DispatchSourceTimer?
@@ -267,8 +269,8 @@ final class MotorVoz {
 
   private func pararDentro() {
     let estaba = enMarcha || montado
+    enMarcha = false // antes del último resumen: al parar no se mira la ruta ni suena ningún tono
     if estaba { resumir() }
-    enMarcha = false
     relojEnvio?.cancel()
     relojSondeo?.cancel()
     relojResumen?.cancel()
@@ -281,6 +283,7 @@ final class MotorVoz {
     colaFrases = []
     pendiente = Data()
     corte += 1
+    finPrevisto = Date.distantPast
     guard estaba else { return }
     try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     anotar("para")
@@ -386,6 +389,7 @@ final class MotorVoz {
     bajada = nil
     desmontarMotor()
     corte += 1
+    finPrevisto = Date.distantPast
     colaFrases = []
     do {
       try configurarSesion(a)
@@ -455,6 +459,26 @@ final class MotorVoz {
     entrada.installTap(onBus: 0, bufferSize: 4096, format: formato) { [weak self] buffer, _ in
       self?.capturado(buffer, conv)
     }
+    // La salida también cambió de formato (8-nov: la sesión pasa de 44.100 a los 16.000 Hz de manos libres): los nodos
+    // siguen conectados con el formato viejo y, sin reconectar, el motor arrancaba y el reproductor quedaba «sonando» sin
+    // que sonara nada (las frases encoladas no llegaban a «sonó»). Se reconecta el mezclador a la salida con el formato de
+    // ahora y los dos reproductores se reinician.
+    let hardware = motor.outputNode.outputFormat(forBus: 0)
+    voz.stop() // tira lo encolado: cuenta como un corte, para que su red de seguridad no salte en falso
+    pitidos.stop()
+    corte += 1
+    finPrevisto = Date.distantPast
+    bajada?.cancel()
+    bajada = nil
+    colaFrases = []
+    if hardware.sampleRate > 0, hardware.channelCount > 0,
+       let salida = AVAudioFormat(standardFormatWithSampleRate: hardware.sampleRate, channels: hardware.channelCount) {
+      motor.connect(motor.mainMixerNode, to: motor.outputNode, format: salida)
+    }
+    motor.connect(voz, to: motor.mainMixerNode, format: formatoVoz)
+    motor.connect(pitidos, to: motor.mainMixerNode, format: formatoVoz)
+    voz.volume = porAltavoz ? 0 : 1
+    anotar("salida reconectada: \(describirFormato(hardware)), voz a volumen \(voz.volume)")
     do {
       motor.prepare()
       try motor.start()
@@ -633,7 +657,10 @@ final class MotorVoz {
     cuenta = Cuenta()
     let nivel = c.dbN > 0 ? "\(Int(c.dbSuma / Double(c.dbN))) dB medio, \(Int(c.dbMax)) dB máximo" : "sin audio del micro"
     let latencia = c.enviosOk > 0 ? "\(c.latSuma / c.enviosOk) ms medio, \(c.latMax) ms máximo" : "-"
-    anotar("resumen 5 s · micro: \(c.buffers) buffers, \(c.bytesCaptados) B, \(nivel) · envíos: \(c.enviosOk) bien, \(c.enviosMal) mal, \(c.bytesEnviados) B, latencia \(latencia) · tirado \(c.bytesTirados) B, pendiente \(pendiente.count) B · sondeos: \(c.sondeosOk) bien, \(c.sondeosMal) mal · motor \(motor.isRunning ? "en marcha" : "parado"), estado \(estadoActual)")
+    let salidaVoz = porAltavoz ? "callada (sin cascos)" : "volumen \(voz.volume), reproductor \(voz.isPlaying ? "sonando" : "parado")"
+    anotar("resumen 5 s · micro: \(c.buffers) buffers, \(c.bytesCaptados) B, \(nivel) · envíos: \(c.enviosOk) bien, \(c.enviosMal) mal, \(c.bytesEnviados) B, latencia \(latencia) · tirado \(c.bytesTirados) B, pendiente \(pendiente.count) B · sondeos: \(c.sondeosOk) bien, \(c.sondeosMal) mal · motor \(motor.isRunning ? "en marcha" : "parado"), estado \(estadoActual) · voz \(salidaVoz) · salida \(describirRuta(AVAudioSession.sharedInstance().currentRoute))")
+    // Por si un aviso de ruta se perdió: cada 5 s se vuelve a mirar si hay cascos (callar o volver a sonar).
+    mirarAltavoz()
   }
 
   private func peticion(_ ruta: String, _ consulta: [URLQueryItem] = []) -> URLRequest? {
@@ -768,6 +795,7 @@ final class MotorVoz {
 
   private func cortar() {
     corte += 1
+    finPrevisto = Date.distantPast
     colaFrases = []
     bajada?.cancel()
     bajada = nil
@@ -826,14 +854,26 @@ final class MotorVoz {
       }
       let segundos = Double(buffer.frameLength) / formatoVoz.sampleRate
       let deEsteCorte = corte
+      let sono = Bandera()
       voz.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
         guard let self = self else { return }
         self.cola.async {
+          sono.hecha = true
           if self.corte == deEsteCorte { self.anotar("♪ sonó \(nombre)") }
         }
       }
       if !voz.isPlaying { voz.play() }
-      anotar("♪ encolada \(nombre): \(String(format: "%.1f", segundos)) s, reproductor \(voz.isPlaying ? "sonando" : "parado")")
+      anotar("♪ encolada \(nombre): \(String(format: "%.1f", segundos)) s, reproductor \(voz.isPlaying ? "sonando" : "parado"), volumen \(voz.volume)")
+      // Red de seguridad: si la frase no ha sonado 5 s después de cuando debería acabar (tras lo que tenga delante), la
+      // salida está rota: se apunta y se monta el motor de nuevo.
+      finPrevisto = max(Date(), finPrevisto).addingTimeInterval(segundos)
+      let margen = finPrevisto.timeIntervalSinceNow + 5
+      cola.asyncAfter(deadline: .now() + margen) { [weak self] in
+        guard let self = self else { return }
+        guard !sono.hecha, self.corte == deEsteCorte, self.enMarcha, !self.porAltavoz else { return }
+        self.anotar("♪ \(nombre) no ha sonado en \(Int(margen)) s: la salida no suena; monto el motor de nuevo")
+        self.rearrancar("la voz no suena")
+      }
     } catch {
       anotar("♪ no pude leer \(nombre): \(error.localizedDescription)")
     }
