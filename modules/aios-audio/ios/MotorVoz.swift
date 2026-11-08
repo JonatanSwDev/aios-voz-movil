@@ -77,6 +77,9 @@ final class MotorVoz {
   private var ultimoContacto = Date()
   private var sinPC = false
   private let plazoSinPC: TimeInterval = 10
+  // El último tic del sondeo: si entre dos tics pasan más de 3 s, la app estuvo suspendida (visto el 8-nov: con el motor
+  // parado iOS la suspende) y el silencio no es del PC: no se avisa de «sin PC» por eso.
+  private var ultimoTic = Date()
 
   private var ultimoNivel = Date.distantPast
   private var reintentos = 0
@@ -84,6 +87,8 @@ final class MotorVoz {
   private var rearranques: [Date] = []
   private var ultimo403 = Date.distantPast
   private var observadores: [NSObjectProtocol] = []
+  // Los avisos de cambio de configuración llegan en ráfaga: se agrupan y se reanuda una vez.
+  private var reanudacionPendiente = false
 
   init() {
     let c = URLSessionConfiguration.default
@@ -106,22 +111,21 @@ final class MotorVoz {
     observadores.append(centro.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) {
       [weak self] n in
       guard let self = self else { return }
-      // Un cambio de configuración (los cascos que se van o vuelven) para el motor. Si sigue en marcha, no hace falta
-      // nada: así no entra en bucle con el aviso que puede dar la propia unidad de voz al encenderse.
-      self.cola.asyncAfter(deadline: .now() + 0.3) {
-        guard let quien = n.object as? AVAudioEngine, quien === self.motor, !self.motor.isRunning else { return }
-        self.rearrancar("cambió la ruta del audio")
+      // Un cambio de configuración para el motor. Visto en el aparato el 8-nov: con la unidad de voz y el micro de los
+      // cascos, iOS lo avisa justo después de cada arranque (la sesión pasa a 16 kHz), sin que cambie la ruta. Montar un
+      // motor nuevo lo volvía a provocar, en bucle: se reanuda el MISMO motor, con el micro enganchado de nuevo.
+      self.cola.async {
+        guard let quien = n.object as? AVAudioEngine, quien === self.motor else { return }
+        self.anotar("aviso de cambio de configuración · \(self.estadoAudio())")
+        self.programarReanudar("cambió la configuración del audio")
       }
     })
-    // Si una interrupción no avisa de que acabó (pasa con mixWithOthers), al volver la app delante se rearranca.
+    // Si una interrupción no avisa de que acabó (pasa con mixWithOthers), al volver la app delante se reanuda.
     observadores.append(centro.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) {
       [weak self] _ in
       guard let self = self else { return }
       self.cola.async {
-        if self.enMarcha && !self.motor.isRunning {
-          self.rearranques = []
-          self.rearrancar("la app vuelve delante")
-        }
+        if self.enMarcha && !self.motor.isRunning { self.programarReanudar("la app vuelve delante") }
       }
     })
   }
@@ -162,6 +166,7 @@ final class MotorVoz {
     colaFrases = []
     pendiente = Data()
     ultimoContacto = Date()
+    ultimoTic = Date()
     sinPC = false
     reintentos = 0
     rearranques = []
@@ -253,7 +258,8 @@ final class MotorVoz {
     }
     let formatoEntrada = entrada.outputFormat(forBus: 0)
     guard formatoEntrada.sampleRate > 0, formatoEntrada.channelCount > 0 else {
-      throw NSError(domain: "MotorVoz", code: 1, userInfo: [NSLocalizedDescriptionKey: "el micro no da formato"])
+      throw NSError(domain: "MotorVoz", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "el micro no da formato (\(estadoAudio()))"])
     }
     guard let conv = AVAudioConverter(from: formatoEntrada, to: formatoEnvio) else {
       throw NSError(domain: "MotorVoz", code: 2, userInfo: [NSLocalizedDescriptionKey: "no hay conversor a 16 kHz"])
@@ -316,6 +322,87 @@ final class MotorVoz {
     }
   }
 
+  /// Agrupa los avisos que llegan seguidos: medio segundo después, una sola reanudación.
+  private func programarReanudar(_ motivo: String) {
+    guard enMarcha, !reanudacionPendiente else { return }
+    reanudacionPendiente = true
+    cola.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+      guard let self = self else { return }
+      self.reanudacionPendiente = false
+      self.reanudarMotor(motivo)
+    }
+  }
+
+  /// Vuelve a poner en marcha el MISMO motor (la unidad de voz ya encendida no se toca): el micro se engancha de nuevo con
+  /// el formato que tenga ahora y el motor arranca. Solo si el motor no está montado, o no vuelve tras diez intentos, se
+  /// monta uno nuevo (`rearrancar`).
+  private func reanudarMotor(_ motivo: String) {
+    guard enMarcha else { return }
+    guard montado else {
+      rearrancar(motivo)
+      return
+    }
+    if motor.isRunning { return }
+    if motivo != "reintento" {
+      let ahora = Date()
+      rearranques = rearranques.filter { ahora.timeIntervalSince($0) < 60 } + [ahora]
+      if rearranques.count > 8 {
+        desmontarMotor()
+        anotar("demasiadas reanudaciones en un minuto (\(motivo)): lo dejo parado; pulsa Parar y Empezar")
+        fijarEstado("error de audio")
+        return
+      }
+    }
+    anotar("reanudo el motor: \(motivo) · \(estadoAudio())")
+    let entrada = motor.inputNode
+    entrada.removeTap(onBus: 0)
+    let formato = entrada.outputFormat(forBus: 0)
+    guard formato.sampleRate > 0, formato.channelCount > 0,
+          let conv = AVAudioConverter(from: formato, to: formatoEnvio) else {
+      reintentos += 1
+      anotar("el micro aún no da formato (\(reintentos)): reintento en 1 s")
+      if reintentos <= 10 {
+        cola.asyncAfter(deadline: .now() + 1) { [weak self] in self?.reanudarMotor("reintento") }
+      } else {
+        rearrancar("el micro no vuelve")
+      }
+      return
+    }
+    entrada.installTap(onBus: 0, bufferSize: 4096, format: formato) { [weak self] buffer, _ in
+      self?.capturado(buffer, conv)
+    }
+    do {
+      motor.prepare()
+      try motor.start()
+      voz.play()
+      pitidos.play()
+      reintentos = 0
+      anotar("motor reanudado: micro a \(Int(formato.sampleRate)) Hz, \(formato.channelCount) canal(es)")
+      fijarEstado(sinPC ? "sin PC" : "conectando")
+    } catch {
+      reintentos += 1
+      anotar("no reanuda (\(reintentos)): \(error.localizedDescription)")
+      fijarEstado("error de audio")
+      if reintentos <= 10 {
+        cola.asyncAfter(deadline: .now() + 2) { [weak self] in self?.reanudarMotor("reintento") }
+      } else {
+        rearrancar("no reanuda")
+      }
+    }
+  }
+
+  /// Para el registro: la frecuencia de la sesión, el micro de la ruta y su formato, y si el motor corre.
+  private func estadoAudio() -> String {
+    let s = AVAudioSession.sharedInstance()
+    var micro = "-"
+    if montado {
+      let f = motor.inputNode.outputFormat(forBus: 0)
+      micro = "\(Int(f.sampleRate)) Hz \(f.channelCount) c"
+    }
+    let entrada = s.currentRoute.inputs.first?.portType.rawValue ?? "?"
+    return "sesión \(Int(s.sampleRate)) Hz, entrada \(entrada), micro \(micro), motor \(motor.isRunning ? "en marcha" : "parado")"
+  }
+
   private func interrupcion(_ n: Notification) {
     guard let valor = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
           let tipo = AVAudioSession.InterruptionType(rawValue: valor) else { return }
@@ -326,7 +413,7 @@ final class MotorVoz {
         self.fijarEstado("interrumpido")
       case .ended:
         self.anotar("interrupción: acaba")
-        self.cola.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.rearrancar("fin de la interrupción") }
+        self.programarReanudar("fin de la interrupción")
       @unknown default:
         break
       }
@@ -589,7 +676,13 @@ final class MotorVoz {
   }
 
   private func vigilarContacto() {
-    guard enMarcha, !sinPC, Date().timeIntervalSince(ultimoContacto) > plazoSinPC else { return }
+    let ahora = Date()
+    if ahora.timeIntervalSince(ultimoTic) > 3 {
+      anotar("vuelvo de estar suspendida \(Int(ahora.timeIntervalSince(ultimoTic))) s: no cuento ese rato como «sin PC»")
+      ultimoContacto = ahora
+    }
+    ultimoTic = ahora
+    guard enMarcha, !sinPC, ahora.timeIntervalSince(ultimoContacto) > plazoSinPC else { return }
     sinPC = true
     anotar("sin PC desde hace \(Int(plazoSinPC)) s")
     fijarEstado("sin PC")
